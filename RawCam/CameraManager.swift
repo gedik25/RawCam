@@ -9,6 +9,8 @@ import AVFoundation
 import Photos
 import SwiftUI
 import Observation
+import CoreMedia
+import UIKit
 
 // MARK: - Lens Type
 
@@ -26,6 +28,42 @@ enum LensType: String, CaseIterable, Sendable {
     }
 }
 
+// MARK: - Camera Preset
+
+enum CameraPreset: String, CaseIterable, Sendable {
+    case auto = "Auto"
+    case portrait = "Portrait"
+    case night = "Night"
+    case action = "Action"
+    case landscape = "Landscape"
+    
+    var displayName: String { rawValue }
+    
+    var icon: String {
+        switch self {
+        case .auto: return "a.circle"
+        case .portrait: return "person.fill"
+        case .night: return "moon.fill"
+        case .action: return "figure.run"
+        case .landscape: return "mountain.2.fill"
+        }
+    }
+}
+
+// MARK: - Exposure Mode
+
+enum ExposureMode: String, CaseIterable, Sendable {
+    case auto = "Auto"
+    case manual = "Manual"
+}
+
+// MARK: - Focus Mode
+
+enum FocusMode: String, CaseIterable, Sendable {
+    case auto = "Auto"
+    case manual = "Manual"
+}
+
 // MARK: - Camera Manager
 
 @Observable
@@ -41,13 +79,42 @@ final class CameraManager: NSObject {
     var lastCaptureStatus: String?
     var cameraPermissionGranted = false
     
+    // MARK: - Exposure Properties
+    
+    var exposureMode: ExposureMode = .auto
+    nonisolated(unsafe) var currentISO: Float = 100
+    var minISO: Float = 50
+    var maxISO: Float = 3200
+    nonisolated(unsafe) var currentShutterSpeed: Double = 1.0 / 60.0 // seconds
+    var minShutterSpeed: Double = 1.0 / 8000.0
+    var maxShutterSpeed: Double = 1.0
+    
+    // MARK: - Focus Properties
+    
+    var focusMode: FocusMode = .auto
+    nonisolated(unsafe) var currentFocusDistance: Float = 0.5 // 0.0 (near) to 1.0 (infinity)
+    var focusPointOfInterest: CGPoint = CGPoint(x: 0.5, y: 0.5)
+    
+    // MARK: - Preset Properties
+    
+    var currentPreset: CameraPreset = .auto
+    
+    // MARK: - Thumbnail
+    
+    var lastCapturedThumbnail: UIImage?
+    
+    // MARK: - Orientation Properties
+    
+    nonisolated(unsafe) private var currentVideoOrientation: AVCaptureVideoOrientation = .portrait
+    nonisolated(unsafe) private var lastValidOrientation: AVCaptureVideoOrientation = .portrait
+    
     // MARK: - AVFoundation Properties
-    // These properties are accessed from sessionQueue, marked as nonisolated(unsafe)
     
     nonisolated(unsafe) let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.rawcam.session.queue")
     nonisolated(unsafe) private let photoOutput = AVCapturePhotoOutput()
     nonisolated(unsafe) private var currentDeviceInput: AVCaptureDeviceInput?
+    nonisolated(unsafe) private var currentDevice: AVCaptureDevice?
     
     // MARK: - Capture Tracking
     
@@ -60,6 +127,97 @@ final class CameraManager: NSObject {
     
     override init() {
         super.init()
+        setupOrientationObserver()
+    }
+    
+    private func setupOrientationObserver() {
+        // Start generating device orientation notifications
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        
+        // Set initial orientation
+        updateCurrentOrientation()
+        
+        // Observe orientation changes via NotificationCenter
+        NotificationCenter.default.addObserver(
+            forName: UIDevice.orientationDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateCurrentOrientation()
+        }
+    }
+    
+    private func updateCurrentOrientation() {
+        let deviceOrientation = UIDevice.current.orientation
+        
+        // Map UIDeviceOrientation to AVCaptureVideoOrientation
+        // Note: Landscape requires cross-mapping due to sensor inversion
+        let videoOrientation: AVCaptureVideoOrientation?
+        
+        switch deviceOrientation {
+        case .portrait:
+            videoOrientation = .portrait
+        case .portraitUpsideDown:
+            videoOrientation = .portraitUpsideDown
+        case .landscapeLeft:
+            // Cross-mapping: device landscapeLeft -> video landscapeRight
+            videoOrientation = .landscapeRight
+        case .landscapeRight:
+            // Cross-mapping: device landscapeRight -> video landscapeLeft
+            videoOrientation = .landscapeLeft
+        case .faceUp, .faceDown, .unknown:
+            // Use fallback for invalid orientations
+            videoOrientation = nil
+        @unknown default:
+            videoOrientation = nil
+        }
+        
+        // Update current orientation or use fallback
+        if let orientation = videoOrientation {
+            currentVideoOrientation = orientation
+            lastValidOrientation = orientation
+        }
+        // If nil, currentVideoOrientation keeps the lastValidOrientation value
+    }
+    
+    /// Returns the video rotation angle for the current orientation
+    private nonisolated func currentVideoRotationAngle() -> CGFloat {
+        switch currentVideoOrientation {
+        case .portrait:
+            return 90
+        case .portraitUpsideDown:
+            return 270
+        case .landscapeRight:
+            return 0
+        case .landscapeLeft:
+            return 180
+        @unknown default:
+            return 90
+        }
+    }
+    
+    /// Forces orientation sync before capture
+    private nonisolated func syncOrientationForCapture() {
+        guard let connection = photoOutput.connection(with: .video) else { return }
+        
+        // Use lastValidOrientation as fallback if current is invalid
+        let orientationToUse = currentVideoOrientation
+        
+        // Set video orientation on connection
+        if connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientationToUse
+        }
+        
+        // Also set rotation angle for iOS 17+
+        let rotationAngle = currentVideoRotationAngle()
+        if connection.isVideoRotationAngleSupported(rotationAngle) {
+            connection.videoRotationAngle = rotationAngle
+        }
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
     }
     
     // MARK: - Permission
@@ -104,7 +262,8 @@ final class CameraManager: NSObject {
             
             self.session.commitConfiguration()
             
-            // Update RAW support status
+            // Update device capabilities
+            self.updateDeviceCapabilities()
             self.updateRawSupportStatus()
         }
     }
@@ -126,9 +285,29 @@ final class CameraManager: NSObject {
             if session.canAddInput(input) {
                 session.addInput(input)
                 currentDeviceInput = input
+                currentDevice = device
             }
         } catch {
             print("Error creating camera input: \(error)")
+        }
+    }
+    
+    private nonisolated func updateDeviceCapabilities() {
+        guard let device = currentDevice else { return }
+        
+        let minIso = device.activeFormat.minISO
+        let maxIso = device.activeFormat.maxISO
+        let minDuration = device.activeFormat.minExposureDuration
+        let maxDuration = device.activeFormat.maxExposureDuration
+        
+        Task { @MainActor in
+            self.minISO = minIso
+            self.maxISO = maxIso
+            self.minShutterSpeed = CMTimeGetSeconds(minDuration)
+            self.maxShutterSpeed = CMTimeGetSeconds(maxDuration)
+            
+            // Clamp current values to valid range
+            self.currentISO = min(max(self.currentISO, minIso), maxIso)
         }
     }
     
@@ -179,11 +358,210 @@ final class CameraManager: NSObject {
             self.setupCameraInput(for: lens)
             self.session.commitConfiguration()
             
+            self.updateDeviceCapabilities()
             self.updateRawSupportStatus()
             
             Task { @MainActor in
                 self.currentLens = lens
             }
+        }
+    }
+    
+    // MARK: - Exposure Control
+    
+    func setExposureMode(_ mode: ExposureMode) {
+        exposureMode = mode
+        
+        sessionQueue.async { [weak self] in
+            guard let self = self, let device = self.currentDevice else { return }
+            
+            do {
+                try device.lockForConfiguration()
+                
+                if mode == .auto {
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                } else {
+                    // Apply current manual settings
+                    self.applyManualExposure()
+                }
+                
+                device.unlockForConfiguration()
+            } catch {
+                print("Error setting exposure mode: \(error)")
+            }
+        }
+    }
+    
+    func setISO(_ iso: Float) {
+        let clampedISO = min(max(iso, minISO), maxISO)
+        currentISO = clampedISO
+        
+        if exposureMode == .manual {
+            applyManualExposureAsync()
+        }
+    }
+    
+    func setShutterSpeed(_ speed: Double) {
+        let clampedSpeed = min(max(speed, minShutterSpeed), maxShutterSpeed)
+        currentShutterSpeed = clampedSpeed
+        
+        if exposureMode == .manual {
+            applyManualExposureAsync()
+        }
+    }
+    
+    private func applyManualExposureAsync() {
+        sessionQueue.async { [weak self] in
+            self?.applyManualExposure()
+        }
+    }
+    
+    private nonisolated func applyManualExposure() {
+        guard let device = currentDevice else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            if device.isExposureModeSupported(.custom) {
+                let duration = CMTimeMakeWithSeconds(currentShutterSpeed, preferredTimescale: 1000000)
+                device.setExposureModeCustom(duration: duration, iso: currentISO) { _ in }
+            }
+            
+            device.unlockForConfiguration()
+        } catch {
+            print("Error applying manual exposure: \(error)")
+        }
+    }
+    
+    // MARK: - Focus Control
+    
+    func setFocusMode(_ mode: FocusMode) {
+        focusMode = mode
+        
+        sessionQueue.async { [weak self] in
+            guard let self = self, let device = self.currentDevice else { return }
+            
+            do {
+                try device.lockForConfiguration()
+                
+                if mode == .auto {
+                    if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.focusMode = .continuousAutoFocus
+                    }
+                } else {
+                    self.applyManualFocus()
+                }
+                
+                device.unlockForConfiguration()
+            } catch {
+                print("Error setting focus mode: \(error)")
+            }
+        }
+    }
+    
+    func setFocusDistance(_ distance: Float) {
+        let clampedDistance = min(max(distance, 0.0), 1.0)
+        currentFocusDistance = clampedDistance
+        
+        if focusMode == .manual {
+            applyManualFocusAsync()
+        }
+    }
+    
+    func focusAt(point: CGPoint) {
+        focusPointOfInterest = point
+        
+        sessionQueue.async { [weak self] in
+            guard let self = self, let device = self.currentDevice else { return }
+            
+            guard device.isFocusPointOfInterestSupported else { return }
+            
+            do {
+                try device.lockForConfiguration()
+                
+                device.focusPointOfInterest = point
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+                
+                // Also set exposure point if supported
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                    if device.isExposureModeSupported(.autoExpose) {
+                        device.exposureMode = .autoExpose
+                    }
+                }
+                
+                device.unlockForConfiguration()
+                
+                Task { @MainActor in
+                    self.focusMode = .auto
+                    self.exposureMode = .auto
+                }
+            } catch {
+                print("Error focusing at point: \(error)")
+            }
+        }
+    }
+    
+    private func applyManualFocusAsync() {
+        sessionQueue.async { [weak self] in
+            self?.applyManualFocus()
+        }
+    }
+    
+    private nonisolated func applyManualFocus() {
+        guard let device = currentDevice else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            if device.isFocusModeSupported(.locked) {
+                device.setFocusModeLocked(lensPosition: currentFocusDistance) { _ in }
+            }
+            
+            device.unlockForConfiguration()
+        } catch {
+            print("Error applying manual focus: \(error)")
+        }
+    }
+    
+    // MARK: - Preset Control
+    
+    func applyPreset(_ preset: CameraPreset) {
+        currentPreset = preset
+        
+        switch preset {
+        case .auto:
+            setExposureMode(.auto)
+            setFocusMode(.auto)
+            
+        case .portrait:
+            setExposureMode(.manual)
+            setISO(100)
+            setShutterSpeed(1.0 / 60.0)
+            setFocusMode(.auto)
+            
+        case .night:
+            setExposureMode(.manual)
+            setISO(1600)
+            setShutterSpeed(1.0 / 15.0)
+            setFocusMode(.auto)
+            
+        case .action:
+            setExposureMode(.manual)
+            setISO(400)
+            setShutterSpeed(1.0 / 1000.0)
+            setFocusMode(.auto)
+            
+        case .landscape:
+            setExposureMode(.manual)
+            setISO(100)
+            setShutterSpeed(1.0 / 125.0)
+            setFocusDistance(1.0) // Focus at infinity
+            setFocusMode(.manual)
         }
     }
     
@@ -210,7 +588,7 @@ final class CameraManager: NSObject {
             // Check if RAW is supported for current lens
             if let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first,
                let rawFileType = self.photoOutput.availableRawPhotoFileTypes.first {
-                // RAW + processed HEIC - will get 2 callbacks
+                // RAW + processed HEIC
                 let processedFormat: [String: Any] = [
                     AVVideoCodecKey: AVVideoCodecType.hevc
                 ]
@@ -223,7 +601,7 @@ final class CameraManager: NSObject {
                 )
                 willCaptureRaw = true
             } else {
-                // Fallback to processed only - will get 1 callback
+                // Fallback to processed only
                 settings = AVCapturePhotoSettings(format: [
                     AVVideoCodecKey: AVVideoCodecType.hevc
                 ])
@@ -231,9 +609,11 @@ final class CameraManager: NSObject {
             }
             
             Task { @MainActor in
-                // RAW+HEIC = 2 callbacks, HEIC only = 1 callback
                 self.expectedCallbackCount = willCaptureRaw ? 2 : 1
             }
+            
+            // Force orientation sync before capture
+            self.syncOrientationForCapture()
             
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
@@ -249,6 +629,21 @@ final class CameraManager: NSObject {
                 self.lastCaptureStatus = nil
             }
         }
+    }
+    
+    // MARK: - Helper Functions
+    
+    func formatShutterSpeed(_ speed: Double) -> String {
+        if speed >= 1.0 {
+            return String(format: "%.1fs", speed)
+        } else {
+            let denominator = Int(round(1.0 / speed))
+            return "1/\(denominator)"
+        }
+    }
+    
+    func formatISO(_ iso: Float) -> String {
+        return "ISO \(Int(iso))"
     }
 }
 
@@ -269,6 +664,14 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                 return
             }
             
+            // Generate thumbnail from processed photo (not RAW)
+            if !photo.isRawPhoto {
+                if let cgImage = photo.cgImageRepresentation() {
+                    let thumbnail = UIImage(cgImage: cgImage)
+                    self.lastCapturedThumbnail = thumbnail
+                }
+            }
+            
             // Save to photo library
             self.savePhotoToLibrary(photo)
         }
@@ -280,7 +683,6 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
         
-        // Check if this is a RAW photo
         let isRaw = photo.isRawPhoto
         let format = isRaw ? "RAW" : "HEIC"
         
@@ -324,7 +726,6 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             capturedFormats.append(format)
         }
         
-        // Check if all callbacks received
         if receivedCallbackCount >= expectedCallbackCount {
             isCaptureInProgress = false
             
@@ -333,12 +734,10 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             } else if capturedFormats.isEmpty {
                 lastCaptureStatus = "Kayıt başarısız"
             } else {
-                // Show combined status
                 let formatString = capturedFormats.joined(separator: " + ")
                 lastCaptureStatus = "\(formatString) kaydedildi"
             }
             
-            // Auto-clear status after 3 seconds
             scheduleStatusClear()
         }
     }
